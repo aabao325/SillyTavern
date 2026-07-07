@@ -20,6 +20,11 @@ import * as Popper from '@popperjs/core';
 import droll from 'droll';
 import morphdom from 'morphdom';
 import { toggle as slideToggle } from 'slidetoggle';
+import chalk from 'chalk';
+import yaml from 'yaml';
+import * as chevrotain from 'chevrotain';
+import { gzipSync, gzip } from 'fflate';
+import { sha256 } from 'js-sha256';
 
 /**
  * Expose the libraries to the 'window' object.
@@ -96,6 +101,12 @@ export default {
     droll,
     morphdom,
     slideToggle,
+    chalk,
+    yaml,
+    chevrotain,
+    gzipSync,
+    gzip,
+    sha256,
 };
 
 export {
@@ -118,4 +129,10 @@ export {
     droll,
     morphdom,
     slideToggle,
+    chalk,
+    yaml,
+    chevrotain,
+    gzipSync,
+    gzip,
+    sha256,
 };

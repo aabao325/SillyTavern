@@ -13,28 +13,28 @@ import {
     saveSettingsDebounced,
     substituteParamsExtended,
     generateRaw,
-    getMaxContextSize,
+    getMaxPromptTokens,
     setExtensionPrompt,
     streamingProcessor,
+    animation_easing,
 } from '../../../script.js';
 import { is_group_generating, selected_group } from '../../group-chats.js';
-import { loadMovingUIState } from '../../power-user.js';
+import { loadMovingUIState, power_user } from '../../power-user.js';
 import { dragElement } from '../../RossAscends-mods.js';
 import { getTextTokens, getTokenCountAsync, tokenizers } from '../../tokenizers.js';
 import { debounce_timeout } from '../../constants.js';
 import { SlashCommandParser } from '../../slash-commands/SlashCommandParser.js';
 import { SlashCommand } from '../../slash-commands/SlashCommand.js';
 import { ARGUMENT_TYPE, SlashCommandArgument, SlashCommandNamedArgument } from '../../slash-commands/SlashCommandArgument.js';
-import { MacrosParser } from '../../macros.js';
+import { macros, MacroCategory } from '../../macros/macro-system.js';
 import { countWebLlmTokens, generateWebLlmChatPrompt, getWebLlmContextSize, isWebLlmSupported } from '../shared.js';
 import { commonEnumProviders } from '../../slash-commands/SlashCommandCommonEnumsProvider.js';
+import { removeReasoningFromString } from '../../reasoning.js';
+import { MacrosParser } from '/scripts/macros.js';
 export { MODULE_NAME };
 
 const MODULE_NAME = '1_memory';
 
-let lastCharacterId = null;
-let lastGroupId = null;
-let lastChatId = null;
 let lastMessageHash = null;
 let lastMessageId = null;
 let inApiCall = false;
@@ -71,7 +71,7 @@ async function getSourceContextSize() {
         return 1024 - 64;
     }
 
-    return getMaxContextSize(overrideLength);
+    return getMaxPromptTokens(overrideLength);
 }
 
 const formatMemoryValue = function (value) {
@@ -251,7 +251,7 @@ function onSummarySourceChange(event) {
 }
 
 function switchSourceControls(value) {
-    $('#memory_settings [data-summary-source]').each((_, element) => {
+    $('#summaryExtensionDrawerContents [data-summary-source], #memory_settings [data-summary-source]').each((_, element) => {
         const source = element.dataset.summarySource.split(',').map(s => s.trim());
         $(element).toggle(source.includes(value));
     });
@@ -349,15 +349,11 @@ function onMaxMessagesPerRequestInput() {
     saveSettingsDebounced();
 }
 
-function saveLastValues() {
-    const context = getContext();
-    lastGroupId = context.groupId;
-    lastCharacterId = context.characterId;
-    lastChatId = context.chatId;
-    lastMessageId = context.chat?.length ?? null;
-    lastMessageHash = getStringHash((context.chat.length && context.chat[context.chat.length - 1]['mes']) ?? '');
-}
-
+/**
+ * Get the latest memory summary from the chat.
+ * @param {ChatMessage[]} chat Chat messages
+ * @returns {string} Latest memory summary or empty string
+ */
 function getLatestMemoryFromChat(chat) {
     if (!Array.isArray(chat) || !chat.length) {
         return '';
@@ -374,6 +370,11 @@ function getLatestMemoryFromChat(chat) {
     return '';
 }
 
+/**
+ * Get the index of the latest memory summary from the chat.
+ * @param {ChatMessage[]} chat Chat messages
+ * @returns {number} Index of the latest memory summary or -1 if not found
+ */
 function getIndexOfLatestChatSummary(chat) {
     if (!Array.isArray(chat) || !chat.length) {
         return -1;
@@ -390,6 +391,29 @@ function getIndexOfLatestChatSummary(chat) {
     return -1;
 }
 
+/**
+ * Check if something is changed during the summarization process.
+ * @param {{ groupId: any; chatId: any; characterId: any; }} context
+ * @returns {boolean} True if the context has changed and the summary should be discarded
+ */
+function isContextChanged(context) {
+    const newContext = getContext();
+    if (newContext.groupId !== context.groupId
+        || newContext.chatId !== context.chatId
+        || (!newContext.groupId && (newContext.characterId !== context.characterId))) {
+        console.log('Context changed, summary discarded');
+        return true;
+    }
+
+    return false;
+}
+
+function onChatChanged() {
+    const context = getContext();
+    const latestMemory = getLatestMemoryFromChat(context.chat);
+    setMemoryContext(latestMemory, false);
+}
+
 async function onChatEvent() {
     // Module not enabled
     if (extension_settings.memory.source === summary_sources.extras && !modules.includes('summarize')) {
@@ -401,24 +425,8 @@ async function onChatEvent() {
         return;
     }
 
-    const context = getContext();
-    const chat = context.chat;
-
-    // no characters or group selected
-    if (!context.groupId && context.characterId === undefined) {
-        return;
-    }
-
     // Streaming in-progress
     if (streamingProcessor && !streamingProcessor.isFinished) {
-        return;
-    }
-
-    // Chat/character/group changed
-    if ((context.groupId && lastGroupId !== context.groupId) || (context.characterId !== lastCharacterId) || (context.chatId !== lastChatId)) {
-        const latestMemory = getLatestMemoryFromChat(chat);
-        setMemoryContext(latestMemory, false);
-        saveLastValues();
         return;
     }
 
@@ -427,8 +435,15 @@ async function onChatEvent() {
         return;
     }
 
+    const context = getContext();
+    const chat = context.chat;
+    // Chat can't be empty.
+    if (chat.length === 0) return;
+
+    const lastMessage = chat[chat.length - 1];
+
     // No new messages - do nothing
-    if (chat.length === 0 || (lastMessageId === chat.length && getStringHash(chat[chat.length - 1].mes) === lastMessageHash)) {
+    if ((lastMessageId === chat.length && getStringHash(lastMessage.mes) === lastMessageHash)) {
         return;
     }
 
@@ -440,16 +455,19 @@ async function onChatEvent() {
 
     // Message has been edited / regenerated - delete the saved memory
     if (chat.length
-        && chat[chat.length - 1].extra
-        && chat[chat.length - 1].extra.memory
+        && lastMessage.extra
+        && lastMessage.extra.memory
         && lastMessageId === chat.length
-        && getStringHash(chat[chat.length - 1].mes) !== lastMessageHash) {
-        delete chat[chat.length - 1].extra.memory;
+        && getStringHash(lastMessage.mes) !== lastMessageHash) {
+        delete lastMessage.extra.memory;
     }
 
     summarizeChat(context)
         .catch(console.error)
-        .finally(saveLastValues);
+        .finally(() => {
+            lastMessageId = context.chat?.length ?? null;
+            lastMessageHash = getStringHash((context.chat.length && context.chat[context.chat.length - 1].mes) ?? '');
+        });
 }
 
 /**
@@ -464,13 +482,7 @@ async function forceSummarizeChat(quiet) {
     }
 
     const context = getContext();
-
     const skipWIAN = extension_settings.memory.SkipWIAN;
-    console.log(`Skipping WIAN? ${skipWIAN}`);
-    if (!context.chatId) {
-        toastr.warning('No chat selected');
-        return '';
-    }
 
     const toast = quiet ? jQuery() : toastr.info('Summarizing chat...', 'Please wait', { timeOut: 0, extendedTimeOut: 0 });
     const value = extension_settings.memory.source === summary_sources.main
@@ -509,7 +521,7 @@ async function summarizeCallback(args, text) {
             case summary_sources.extras:
                 return await callExtrasSummarizeAPI(text);
             case summary_sources.main:
-                return await generateRaw(text, '', false, false, prompt, extension_settings.memory.overrideResponseLength);
+                return removeReasoningFromString(await generateRaw({ prompt: text, systemPrompt: prompt, responseLength: extension_settings.memory.overrideResponseLength }));
             case summary_sources.webllm: {
                 const messages = [{ role: 'system', content: prompt }, { role: 'user', content: text }].filter(m => m.content);
                 const params = extension_settings.memory.overrideResponseLength > 0 ? { max_tokens: extension_settings.memory.overrideResponseLength } : {};
@@ -648,7 +660,6 @@ async function summarizeChatWebLLM(context, force) {
     try {
         inApiCall = true;
         const summary = await generateWebLlmChatPrompt(messages, params);
-        const newContext = getContext();
 
         if (!summary) {
             console.warn('Empty summary received');
@@ -656,10 +667,7 @@ async function summarizeChatWebLLM(context, force) {
         }
 
         // something changed during summarization request
-        if (newContext.groupId !== context.groupId ||
-            newContext.chatId !== context.chatId ||
-            (!newContext.groupId && (newContext.characterId !== context.characterId))) {
-            console.log('Context changed, summary discarded');
+        if (isContextChanged(context)) {
             return;
         }
 
@@ -684,7 +692,13 @@ async function summarizeChatMain(context, force, skipWIAN) {
     if (prompt_builders.DEFAULT === extension_settings.memory.prompt_builder) {
         try {
             inApiCall = true;
-            summary = await generateQuietPrompt(prompt, false, skipWIAN, '', '', extension_settings.memory.overrideResponseLength);
+            /** @type {import('../../../script.js').GenerateQuietPromptParams} */
+            const params = {
+                quietPrompt: prompt,
+                skipWIAN: skipWIAN,
+                responseLength: extension_settings.memory.overrideResponseLength,
+            };
+            summary = await generateQuietPrompt(params);
         } finally {
             inApiCall = false;
         }
@@ -708,7 +722,14 @@ async function summarizeChatMain(context, force, skipWIAN) {
                 return null;
             }
 
-            summary = await generateRaw(rawPrompt, '', false, false, prompt, extension_settings.memory.overrideResponseLength);
+            /** @type {import('../../../script.js').GenerateRawParams} */
+            const params = {
+                prompt: rawPrompt,
+                systemPrompt: prompt,
+                responseLength: extension_settings.memory.overrideResponseLength,
+            };
+            const rawSummary = await generateRaw(params);
+            summary = removeReasoningFromString(rawSummary);
             index = lastUsedIndex;
         } finally {
             inApiCall = false;
@@ -723,13 +744,7 @@ async function summarizeChatMain(context, force, skipWIAN) {
         return;
     }
 
-    const newContext = getContext();
-
-    // something changed during summarization request
-    if (newContext.groupId !== context.groupId
-        || newContext.chatId !== context.chatId
-        || (!newContext.groupId && (newContext.characterId !== context.characterId))) {
-        console.log('Context changed, summary discarded');
+    if (isContextChanged(context)) {
         return;
     }
 
@@ -855,27 +870,20 @@ async function summarizeChatExtras(context) {
     try {
         inApiCall = true;
         const summary = await callExtrasSummarizeAPI(resultingString);
-        const newContext = getContext();
 
         if (!summary) {
             console.warn('Empty summary received');
             return;
         }
 
-        // something changed during summarization request
-        if (newContext.groupId !== context.groupId
-            || newContext.chatId !== context.chatId
-            || (!newContext.groupId && (newContext.characterId !== context.characterId))) {
-            console.log('Context changed, summary discarded');
+        if (isContextChanged(context)) {
             return;
         }
 
         setMemoryContext(summary, true);
-    }
-    catch (error) {
+    } catch (error) {
         console.log(error);
-    }
-    finally {
+    } finally {
         inApiCall = false;
     }
 }
@@ -990,21 +998,22 @@ function doPopout(e) {
     </div>`;
         const newElement = $(template);
         newElement.attr('id', 'summaryExtensionPopout')
+            .css('opacity', 0)
             .removeClass('zoomed_avatar')
             .addClass('draggable')
             .empty();
-        const prevSummaryBoxContents = $('#memory_contents').val(); //copy summary box before emptying
+        const prevSummaryBoxContents = $('#memory_contents').val().toString(); //copy summary box before emptying
         originalElement.empty();
         originalElement.html('<div class="flex-container alignitemscenter justifyCenter wide100p"><small>Currently popped out</small></div>');
         newElement.append(controlBarHtml).append(originalHTMLClone);
-        $('body').append(newElement);
+        $('#movingDivs').append(newElement);
+        newElement.transition({ opacity: 1, duration: animation_duration, easing: animation_easing });
         $('#summaryExtensionDrawerContents').addClass('scrollableInnerFull');
         setMemoryContext(prevSummaryBoxContents, false); //paste prev summary box contents into popout box
         setupListeners();
         loadSettings();
         loadMovingUIState();
 
-        $('#summaryExtensionPopout').fadeIn(animation_duration);
         dragElement(newElement);
 
         //setup listener for close button to restore extensions menu
@@ -1013,7 +1022,7 @@ function doPopout(e) {
             const summaryPopoutHTML = $('#summaryExtensionDrawerContents');
             $('#summaryExtensionPopout').fadeOut(animation_duration, () => {
                 originalElement.empty();
-                originalElement.html(summaryPopoutHTML);
+                originalElement.append(summaryPopoutHTML);
                 $('#summaryExtensionPopout').remove();
             });
             loadSettings();
@@ -1027,35 +1036,34 @@ function doPopout(e) {
 function setupListeners() {
     //setup shared listeners for popout and regular ext menu
     $('#memory_restore').off('click').on('click', onMemoryRestoreClick);
-    $('#memory_contents').off('click').on('input', onMemoryContentInput);
-    $('#memory_frozen').off('click').on('input', onMemoryFrozenInput);
-    $('#memory_skipWIAN').off('click').on('input', onMemorySkipWIANInput);
-    $('#summary_source').off('click').on('change', onSummarySourceChange);
-    $('#memory_prompt_words').off('click').on('input', onMemoryPromptWordsInput);
-    $('#memory_prompt_interval').off('click').on('input', onMemoryPromptIntervalInput);
-    $('#memory_prompt').off('click').on('input', onMemoryPromptInput);
+    $('#memory_contents').off('input').on('input', onMemoryContentInput);
+    $('#memory_frozen').off('input').on('input', onMemoryFrozenInput);
+    $('#memory_skipWIAN').off('input').on('input', onMemorySkipWIANInput);
+    $('#summary_source').off('change').on('change', onSummarySourceChange);
+    $('#memory_prompt_words').off('input').on('input', onMemoryPromptWordsInput);
+    $('#memory_prompt_interval').off('input').on('input', onMemoryPromptIntervalInput);
+    $('#memory_prompt').off('input').on('input', onMemoryPromptInput);
     $('#memory_force_summarize').off('click').on('click', () => forceSummarizeChat(false));
-    $('#memory_template').off('click').on('input', onMemoryTemplateInput);
-    $('#memory_depth').off('click').on('input', onMemoryDepthInput);
-    $('#memory_role').off('click').on('input', onMemoryRoleInput);
-    $('input[name="memory_position"]').off('click').on('change', onMemoryPositionChange);
-    $('#memory_prompt_words_force').off('click').on('input', onMemoryPromptWordsForceInput);
-    $('#memory_prompt_builder_default').off('click').on('input', onMemoryPromptBuilderInput);
-    $('#memory_prompt_builder_raw_blocking').off('click').on('input', onMemoryPromptBuilderInput);
-    $('#memory_prompt_builder_raw_non_blocking').off('click').on('input', onMemoryPromptBuilderInput);
+    $('#memory_template').off('input').on('input', onMemoryTemplateInput);
+    $('#memory_depth').off('input').on('input', onMemoryDepthInput);
+    $('#memory_role').off('input').on('input', onMemoryRoleInput);
+    $('input[name="memory_position"]').off('change').on('change', onMemoryPositionChange);
+    $('#memory_prompt_words_force').off('input').on('input', onMemoryPromptWordsForceInput);
+    $('#memory_prompt_builder_default').off('input').on('input', onMemoryPromptBuilderInput);
+    $('#memory_prompt_builder_raw_blocking').off('input').on('input', onMemoryPromptBuilderInput);
+    $('#memory_prompt_builder_raw_non_blocking').off('input').on('input', onMemoryPromptBuilderInput);
     $('#memory_prompt_restore').off('click').on('click', onMemoryPromptRestoreClick);
     $('#memory_prompt_interval_auto').off('click').on('click', onPromptIntervalAutoClick);
     $('#memory_prompt_words_auto').off('click').on('click', onPromptForceWordsAutoClick);
-    $('#memory_override_response_length').off('click').on('input', onOverrideResponseLengthInput);
-    $('#memory_max_messages_per_request').off('click').on('input', onMaxMessagesPerRequestInput);
+    $('#memory_override_response_length').off('input').on('input', onOverrideResponseLengthInput);
+    $('#memory_max_messages_per_request').off('input').on('input', onMaxMessagesPerRequestInput);
     $('#memory_include_wi_scan').off('input').on('input', onMemoryIncludeWIScanInput);
     $('#summarySettingsBlockToggle').off('click').on('click', function () {
-        console.log('saw settings button click');
-        $('#summarySettingsBlock').slideToggle(200, 'swing'); //toggleClass("hidden");
+        $('#summarySettingsBlock').slideToggle(200, 'swing');
     });
 }
 
-jQuery(async function () {
+export async function init() {
     async function addExtensionControls() {
         const settingsHtml = await renderExtensionTemplateAsync('memory', 'settings', { defaultSettings });
         $('#summarize_container').append(settingsHtml);
@@ -1068,11 +1076,11 @@ jQuery(async function () {
 
     await addExtensionControls();
     loadSettings();
+    eventSource.on(event_types.CHAT_CHANGED, onChatChanged);
     eventSource.makeLast(event_types.CHARACTER_MESSAGE_RENDERED, onChatEvent);
-    eventSource.on(event_types.MESSAGE_DELETED, onChatEvent);
-    eventSource.on(event_types.MESSAGE_EDITED, onChatEvent);
-    eventSource.on(event_types.MESSAGE_SWIPED, onChatEvent);
-    eventSource.on(event_types.CHAT_CHANGED, onChatEvent);
+    for (const event of [event_types.MESSAGE_DELETED, event_types.MESSAGE_UPDATED, event_types.MESSAGE_SWIPED]) {
+        eventSource.on(event, onChatEvent);
+    }
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'summarize',
         callback: summarizeCallback,
@@ -1099,5 +1107,25 @@ jQuery(async function () {
         returns: ARGUMENT_TYPE.STRING,
     }));
 
-    MacrosParser.registerMacro('summary', () => getLatestMemoryFromChat(getContext().chat));
-});
+    const summaryMacroHandler = () => {
+        // Checking content of the UI summary box first
+        const uiSummary = $('#memory_contents').val().toString();
+        if (uiSummary.trim().length > 0) {
+            return uiSummary;
+        }
+        // Fallback to scanning the chat for the latest summary if the UI summary box is empty
+        return getLatestMemoryFromChat(getContext().chat);
+    };
+    if (power_user.experimental_macro_engine) {
+        macros.register('summary', {
+            category: MacroCategory.CHAT,
+            description: 'Returns the latest memory/summary from the current chat.',
+            handler: () => summaryMacroHandler(),
+        });
+    } else {
+        // TODO: Remove this when the experimental macro engine is replacing the old macro engine
+        MacrosParser.registerMacro('summary',
+            () => summaryMacroHandler(),
+            'Returns the latest memory/summary from the current chat.');
+    }
+}

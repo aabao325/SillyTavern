@@ -1,9 +1,9 @@
 import fetch from 'node-fetch';
 import express from 'express';
+import ipRegex from 'ip-regex';
 
 import { decode } from 'html-entities';
 import { readSecret, SECRET_KEYS } from './secrets.js';
-import { jsonParser } from '../express-common.js';
 import { trimV1 } from '../util.js';
 import { setAdditionalHeaders } from '../additional-headers.js';
 
@@ -52,7 +52,7 @@ async function extractTranscript(videoPageBody, lang) {
         } catch (e) {
             return undefined;
         }
-    })()?.['playerCaptionsTracklistRenderer'];
+    })()?.playerCaptionsTracklistRenderer;
 
     if (!captions) {
         throw new Error('Transcript disabled');
@@ -91,7 +91,7 @@ async function extractTranscript(videoPageBody, lang) {
     return transcriptText;
 }
 
-router.post('/serpapi', jsonParser, async (request, response) => {
+router.post('/serpapi', async (request, response) => {
     try {
         const key = readSecret(request.user.directories, SECRET_KEYS.SERPAPI);
 
@@ -124,7 +124,7 @@ router.post('/serpapi', jsonParser, async (request, response) => {
  * Get the transcript of a YouTube video
  * @copyright https://github.com/Kakulukian/youtube-transcript (MIT License)
  */
-router.post('/transcript', jsonParser, async (request, response) => {
+router.post('/transcript', async (request, response) => {
     try {
         const id = request.body.id;
         const lang = request.body.lang;
@@ -161,7 +161,7 @@ router.post('/transcript', jsonParser, async (request, response) => {
     }
 });
 
-router.post('/searxng', jsonParser, async (request, response) => {
+router.post('/searxng', async (request, response) => {
     try {
         const { baseUrl, query, preferences, categories } = request.body;
 
@@ -215,7 +215,7 @@ router.post('/searxng', jsonParser, async (request, response) => {
     }
 });
 
-router.post('/tavily', jsonParser, async (request, response) => {
+router.post('/tavily', async (request, response) => {
     try {
         const apiKey = readSecret(request.user.directories, SECRET_KEYS.TAVILY);
 
@@ -264,7 +264,7 @@ router.post('/tavily', jsonParser, async (request, response) => {
     }
 });
 
-router.post('/koboldcpp', jsonParser, async (request, response) => {
+router.post('/koboldcpp', async (request, response) => {
     try {
         const { query, url } = request.body;
 
@@ -300,7 +300,7 @@ router.post('/koboldcpp', jsonParser, async (request, response) => {
     }
 });
 
-router.post('/serper', jsonParser, async (request, response) => {
+router.post('/serper', async (request, response) => {
     try {
         const key = readSecret(request.user.directories, SECRET_KEYS.SERPER);
 
@@ -342,7 +342,53 @@ router.post('/serper', jsonParser, async (request, response) => {
     }
 });
 
-router.post('/visit', jsonParser, async (request, response) => {
+router.post('/zai', async (request, response) => {
+    try {
+        const key = readSecret(request.user.directories, SECRET_KEYS.ZAI);
+
+        if (!key) {
+            console.error('No Z.AI key found');
+            return response.sendStatus(400);
+        }
+
+        const { query } = request.body;
+
+        if (!query) {
+            console.error('No query provided for /zai');
+            return response.sendStatus(400);
+        }
+
+        console.debug('Z.AI web search query', query);
+
+        const result = await fetch('https://api.z.ai/api/paas/v4/web_search', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${key}`,
+            },
+            body: JSON.stringify({
+                // TODO: There's only one engine option for now
+                search_engine: 'search-prime',
+                search_query: query,
+            }),
+        });
+
+        if (!result.ok) {
+            const text = await result.text();
+            console.error('Z.AI request failed', result.statusText, text);
+            return response.status(500).send(text);
+        }
+
+        const data = await result.json();
+        console.debug('Z.AI web search response', data);
+        return response.json(data);
+    } catch (error) {
+        console.error(error);
+        return response.sendStatus(500);
+    }
+});
+
+router.post('/visit', async (request, response) => {
     try {
         const url = request.body.url;
         const html = Boolean(request.body.html ?? true);
@@ -371,7 +417,7 @@ router.post('/visit', jsonParser, async (request, response) => {
             }
 
             // Reject IP addresses
-            if (urlObj.hostname.match(/^\d+\.\d+\.\d+\.\d+$/)) {
+            if (ipRegex.v4({ exact: true }).test(urlObj.hostname) || ipRegex.v6({ exact: true }).test(urlObj.hostname)) {
                 throw new Error('Invalid hostname');
             }
         } catch (error) {

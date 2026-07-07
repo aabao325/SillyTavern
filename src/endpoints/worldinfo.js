@@ -3,9 +3,9 @@ import path from 'node:path';
 
 import express from 'express';
 import sanitize from 'sanitize-filename';
+import _ from 'lodash';
 import { sync as writeFileAtomicSync } from 'write-file-atomic';
-
-import { jsonParser, urlencodedParser } from '../express-common.js';
+import { tryParse } from '../util.js';
 
 /**
  * Reads a World Info file and returns its contents
@@ -21,7 +21,7 @@ export function readWorldInfoFile(directories, worldInfoName, allowDummy) {
         return dummyObject;
     }
 
-    const filename = `${worldInfoName}.json`;
+    const filename = sanitize(`${worldInfoName}.json`);
     const pathToWorldInfo = path.join(directories.worlds, filename);
 
     if (!fs.existsSync(pathToWorldInfo)) {
@@ -36,7 +36,39 @@ export function readWorldInfoFile(directories, worldInfoName, allowDummy) {
 
 export const router = express.Router();
 
-router.post('/get', jsonParser, (request, response) => {
+router.post('/list', async (request, response) => {
+    try {
+        const data = [];
+        const jsonFiles = (await fs.promises.readdir(request.user.directories.worlds, { withFileTypes: true }))
+            .filter((file) => file.isFile() && path.extname(file.name).toLowerCase() === '.json')
+            .sort((a, b) => a.name.localeCompare(b.name));
+
+        for (const file of jsonFiles) {
+            try {
+                const filePath = path.join(request.user.directories.worlds, file.name);
+                const fileContents = await fs.promises.readFile(filePath, 'utf8');
+                const fileContentsParsed = tryParse(fileContents) || {};
+                const fileExtensions = fileContentsParsed?.extensions || {};
+                const fileNameWithoutExt = path.parse(file.name).name;
+                const fileData = {
+                    file_id: fileNameWithoutExt,
+                    name: fileContentsParsed?.name || fileNameWithoutExt,
+                    extensions: _.isObjectLike(fileExtensions) ? fileExtensions : {},
+                };
+                data.push(fileData);
+            } catch (err) {
+                console.warn(`Error reading or parsing World Info file ${file.name}:`, err);
+            }
+        }
+
+        return response.send(data);
+    } catch (err) {
+        console.error('Error reading World Info directory:', err);
+        return response.sendStatus(500);
+    }
+});
+
+router.post('/get', (request, response) => {
     if (!request.body?.name) {
         return response.sendStatus(400);
     }
@@ -46,7 +78,7 @@ router.post('/get', jsonParser, (request, response) => {
     return response.send(file);
 });
 
-router.post('/delete', jsonParser, (request, response) => {
+router.post('/delete', (request, response) => {
     if (!request.body?.name) {
         return response.sendStatus(400);
     }
@@ -59,12 +91,12 @@ router.post('/delete', jsonParser, (request, response) => {
         throw new Error(`World info file ${filename} doesn't exist.`);
     }
 
-    fs.rmSync(pathToWorldInfo);
+    fs.unlinkSync(pathToWorldInfo);
 
     return response.sendStatus(200);
 });
 
-router.post('/import', urlencodedParser, (request, response) => {
+router.post('/import', (request, response) => {
     if (!request.file) return response.sendStatus(400);
 
     const filename = `${path.parse(sanitize(request.file.originalname)).name}.json`;
@@ -99,7 +131,7 @@ router.post('/import', urlencodedParser, (request, response) => {
     return response.send({ name: worldName });
 });
 
-router.post('/edit', jsonParser, (request, response) => {
+router.post('/edit', (request, response) => {
     if (!request.body) {
         return response.sendStatus(400);
     }
@@ -116,7 +148,7 @@ router.post('/edit', jsonParser, (request, response) => {
         return response.status(400).send('Is not a valid world info file');
     }
 
-    const filename = `${sanitize(request.body.name)}.json`;
+    const filename = sanitize(`${request.body.name}.json`);
     const pathToFile = path.join(request.user.directories.worlds, filename);
 
     writeFileAtomicSync(pathToFile, JSON.stringify(request.body.data, null, 4));

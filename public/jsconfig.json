@@ -6,7 +6,13 @@
         "moduleResolution": "node",
         "allowUmdGlobalAccess": true,
         "allowSyntheticDefaultImports": true,
-        "strictBindCallApply": true
+        "strictBindCallApply": true,
+        "baseUrl": ".",
+        "paths": {
+            "/*": [
+                "./*"
+            ]
+        }
     },
     "exclude": [
         "**/node_modules/**",
@@ -14,7 +20,8 @@
         "**/.git/**",
         "lib/**",
         "**/*.min.js",
-        "scripts/extensions/quick-reply/lib/**"
+        "scripts/extensions/quick-reply/lib/**",
+        "scripts/extensions/tts/lib/**"
     ],
     "typeAcquisition": {
         "include": []

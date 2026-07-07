@@ -4,16 +4,20 @@ import path from 'node:path';
 import express from 'express';
 import _ from 'lodash';
 import { sync as writeFileAtomicSync } from 'write-file-atomic';
+import bytes from 'bytes';
 
 import { SETTINGS_FILE } from '../constants.js';
 import { getConfigValue, generateTimestamp, removeOldBackups } from '../util.js';
-import { jsonParser } from '../express-common.js';
 import { getAllUserHandles, getUserDirectories } from '../users.js';
 import { getFileNameValidationFunction } from '../middleware/validateFileName.js';
 
-const ENABLE_EXTENSIONS = !!getConfigValue('extensions.enabled', true);
-const ENABLE_EXTENSIONS_AUTO_UPDATE = !!getConfigValue('extensions.autoUpdate', true);
-const ENABLE_ACCOUNTS = getConfigValue('enableUserAccounts', false);
+const ENABLE_EXTENSIONS = !!getConfigValue('extensions.enabled', true, 'boolean');
+const ENABLE_EXTENSIONS_AUTO_UPDATE = !!getConfigValue('extensions.autoUpdate', true, 'boolean');
+const ENABLE_ACCOUNTS = !!getConfigValue('enableUserAccounts', false, 'boolean');
+const ENABLE_REQUEST_COMPRESSION = !!getConfigValue('performance.requestCompression.enabled', false, 'boolean');
+const REQUEST_COMPRESSION_MIN = bytes.parse(getConfigValue('performance.requestCompression.minPayloadSize', '256kb'));
+const REQUEST_COMPRESSION_MAX = bytes.parse(getConfigValue('performance.requestCompression.maxPayloadSize', '8mb'));
+const REQUEST_COMPRESSION_TIMEOUT = Number(getConfigValue('performance.requestCompression.timeout', 3000, 'number'));
 
 // 10 minutes
 const AUTOSAVE_INTERVAL = 10 * 60 * 1000;
@@ -59,8 +63,7 @@ function readAndParseFromDirectory(directoryPath, fileExtension = '.json') {
         try {
             const file = fs.readFileSync(path.join(directoryPath, item), 'utf-8');
             parsedFiles.push(fileExtension == '.json' ? JSON.parse(file) : file);
-        }
-        catch {
+        } catch {
             // skip
         }
     });
@@ -82,7 +85,7 @@ function sortByName(_) {
  * @param {string} handle User handle
  * @returns {string} File prefix
  */
-function getFilePrefix(handle) {
+export function getSettingsBackupFilePrefix(handle) {
     return `settings_${handle}_`;
 }
 
@@ -132,7 +135,12 @@ async function backupSettings() {
  */
 function backupUserSettings(handle, preventDuplicates) {
     const userDirectories = getUserDirectories(handle);
-    const backupFile = path.join(userDirectories.backups, `${getFilePrefix(handle)}${generateTimestamp()}.json`);
+
+    if (!fs.existsSync(userDirectories.root)) {
+        return;
+    }
+
+    const backupFile = path.join(userDirectories.backups, `${getSettingsBackupFilePrefix(handle)}${generateTimestamp()}.json`);
     const sourceFile = path.join(userDirectories.root, SETTINGS_FILE);
 
     if (preventDuplicates && isDuplicateBackup(handle, sourceFile)) {
@@ -184,7 +192,7 @@ function areFilesEqual(file1, file2) {
 function getLatestBackup(handle) {
     const userDirectories = getUserDirectories(handle);
     const backupFiles = fs.readdirSync(userDirectories.backups)
-        .filter(x => x.startsWith(getFilePrefix(handle)))
+        .filter(x => x.startsWith(getSettingsBackupFilePrefix(handle)))
         .map(x => ({ name: x, ctime: fs.statSync(path.join(userDirectories.backups, x)).ctimeMs }));
     const latestBackup = backupFiles.sort((a, b) => b.ctime - a.ctime)[0]?.name;
     if (!latestBackup) {
@@ -195,7 +203,7 @@ function getLatestBackup(handle) {
 
 export const router = express.Router();
 
-router.post('/save', jsonParser, function (request, response) {
+router.post('/save', function (request, response) {
     try {
         const pathToSettings = path.join(request.user.directories.root, SETTINGS_FILE);
         writeFileAtomicSync(pathToSettings, JSON.stringify(request.body, null, 4), 'utf8');
@@ -208,7 +216,7 @@ router.post('/save', jsonParser, function (request, response) {
 });
 
 // Wintermute's code
-router.post('/get', jsonParser, (request, response) => {
+router.post('/get', (request, response) => {
     let settings;
     try {
         const pathToSettings = path.join(request.user.directories.root, SETTINGS_FILE);
@@ -255,6 +263,7 @@ router.post('/get', jsonParser, (request, response) => {
     const instruct = readAndParseFromDirectory(request.user.directories.instruct);
     const context = readAndParseFromDirectory(request.user.directories.context);
     const sysprompt = readAndParseFromDirectory(request.user.directories.sysprompt);
+    const reasoning = readAndParseFromDirectory(request.user.directories.reasoning);
 
     response.send({
         settings,
@@ -273,16 +282,23 @@ router.post('/get', jsonParser, (request, response) => {
         instruct,
         context,
         sysprompt,
+        reasoning,
         enable_extensions: ENABLE_EXTENSIONS,
         enable_extensions_auto_update: ENABLE_EXTENSIONS_AUTO_UPDATE,
         enable_accounts: ENABLE_ACCOUNTS,
+        request_compression: {
+            enabled: ENABLE_REQUEST_COMPRESSION,
+            minPayloadSize: REQUEST_COMPRESSION_MIN || 0,
+            maxPayloadSize: REQUEST_COMPRESSION_MAX || 0,
+            timeout: REQUEST_COMPRESSION_TIMEOUT || 0,
+        },
     });
 });
 
-router.post('/get-snapshots', jsonParser, async (request, response) => {
+router.post('/get-snapshots', async (request, response) => {
     try {
         const snapshots = fs.readdirSync(request.user.directories.backups);
-        const userFilesPattern = getFilePrefix(request.user.profile.handle);
+        const userFilesPattern = getSettingsBackupFilePrefix(request.user.profile.handle);
         const userSnapshots = snapshots.filter(x => x.startsWith(userFilesPattern));
 
         const result = userSnapshots.map(x => {
@@ -297,9 +313,9 @@ router.post('/get-snapshots', jsonParser, async (request, response) => {
     }
 });
 
-router.post('/load-snapshot', jsonParser, getFileNameValidationFunction('name'), async (request, response) => {
+router.post('/load-snapshot', getFileNameValidationFunction('name'), async (request, response) => {
     try {
-        const userFilesPattern = getFilePrefix(request.user.profile.handle);
+        const userFilesPattern = getSettingsBackupFilePrefix(request.user.profile.handle);
 
         if (!request.body.name || !request.body.name.startsWith(userFilesPattern)) {
             return response.status(400).send({ error: 'Invalid snapshot name' });
@@ -321,7 +337,7 @@ router.post('/load-snapshot', jsonParser, getFileNameValidationFunction('name'),
     }
 });
 
-router.post('/make-snapshot', jsonParser, async (request, response) => {
+router.post('/make-snapshot', async (request, response) => {
     try {
         backupUserSettings(request.user.profile.handle, false);
         response.sendStatus(204);
@@ -331,9 +347,9 @@ router.post('/make-snapshot', jsonParser, async (request, response) => {
     }
 });
 
-router.post('/restore-snapshot', jsonParser, getFileNameValidationFunction('name'), async (request, response) => {
+router.post('/restore-snapshot', getFileNameValidationFunction('name'), async (request, response) => {
     try {
-        const userFilesPattern = getFilePrefix(request.user.profile.handle);
+        const userFilesPattern = getSettingsBackupFilePrefix(request.user.profile.handle);
 
         if (!request.body.name || !request.body.name.startsWith(userFilesPattern)) {
             return response.status(400).send({ error: 'Invalid snapshot name' });

@@ -8,12 +8,14 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
-import { default as git } from 'simple-git';
+import { default as git, CheckRepoActions } from 'simple-git';
+import { createGitClient } from './src/git/client.js';
 import { color } from './src/util.js';
 
 const __dirname = import.meta.dirname ?? path.dirname(fileURLToPath(import.meta.url));
 process.chdir(__dirname);
 const pluginsPath = './plugins';
+const gitBackend = process.env.SILLYTAVERN_GIT_BACKEND || 'auto';
 
 const command = process.argv[2];
 
@@ -49,7 +51,7 @@ async function updatePlugins() {
             const pluginPath = path.join(pluginsPath, directory);
             const pluginRepo = git(pluginPath);
 
-            const isRepo = await pluginRepo.checkIsRepo();
+            const isRepo = await pluginRepo.checkIsRepo(CheckRepoActions.IS_REPO_ROOT);
             if (!isRepo) {
                 console.log(`Directory ${color.yellow(directory)} is not a Git repository`);
                 continue;
@@ -87,10 +89,9 @@ async function installPlugin(pluginName) {
             return console.log(color.yellow(`Directory already exists at ${pluginPath}`));
         }
 
-        await git().clone(pluginName, pluginPath, { '--depth': 1 });
+        await createGitClient({ backend: gitBackend }).clone(pluginName, pluginPath, { depth: 1 });
         console.log(`Plugin ${color.green(pluginName)} installed to ${color.cyan(pluginPath)}`);
-    }
-    catch (error) {
+    } catch (error) {
         console.error(color.red(`Failed to install plugin ${pluginName}`), error);
     }
 }

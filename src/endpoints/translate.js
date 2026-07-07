@@ -1,14 +1,11 @@
-import { createRequire } from 'node:module';
-
 import fetch from 'node-fetch';
 import express from 'express';
 import { translate as bingTranslate } from 'bing-translate-api';
-import iconv from 'iconv-lite';
 import urlJoin from 'url-join';
+import { Translator } from 'google-translate-api-x';
 
 import { readSecret, SECRET_KEYS } from './secrets.js';
 import { getConfigValue, uuidv4 } from '../util.js';
-import { jsonParser } from '../express-common.js';
 
 const DEEPLX_URL_DEFAULT = 'http://127.0.0.1:1188/translate';
 const ONERING_URL_DEFAULT = 'http://127.0.0.1:4990/translate';
@@ -16,31 +13,7 @@ const LINGVA_DEFAULT = 'https://lingva.ml/api/v1';
 
 export const router = express.Router();
 
-/**
- * Get the Google Translate API client.
- * @returns {import('google-translate-api-browser')} Google Translate API client
- */
-function getGoogleTranslateClient() {
-    const require = createRequire(import.meta.url);
-    const googleTranslateApi = require('google-translate-api-browser');
-    return googleTranslateApi;
-}
-
-/**
- * Tries to decode an ArrayBuffer to a string using iconv-lite for UTF-8.
- * @param {ArrayBuffer} buffer ArrayBuffer
- * @returns {string} Decoded string
- */
-function decodeBuffer(buffer) {
-    try {
-        return iconv.decode(Buffer.from(buffer), 'utf-8');
-    } catch (error) {
-        console.error('Failed to decode buffer:', error);
-        return Buffer.from(buffer).toString('utf-8');
-    }
-}
-
-router.post('/libre', jsonParser, async (request, response) => {
+router.post('/libre', async (request, response) => {
     try {
         const key = readSecret(request.user.directories, SECRET_KEYS.LIBRE);
         const url = readSecret(request.user.directories, SECRET_KEYS.LIBRE_URL);
@@ -100,10 +73,14 @@ router.post('/libre', jsonParser, async (request, response) => {
     }
 });
 
-router.post('/google', jsonParser, async (request, response) => {
+router.post('/google', async (request, response) => {
     try {
-        const text = request.body.text;
-        const lang = request.body.lang;
+        if (request.body.lang === 'pt-BR') {
+            request.body.lang = 'pt';
+        }
+
+        const text = String(request.body.text ?? '');
+        const lang = String(request.body.lang ?? '');
 
         if (!text || !lang) {
             return response.sendStatus(400);
@@ -111,18 +88,8 @@ router.post('/google', jsonParser, async (request, response) => {
 
         console.debug('Input text: ' + text);
 
-        const { generateRequestUrl, normaliseResponse } = getGoogleTranslateClient();
-        const requestUrl = generateRequestUrl(text, { to: lang });
-        const result = await fetch(requestUrl);
-
-        if (!result.ok) {
-            console.warn('Google Translate error: ', result.statusText);
-            return response.sendStatus(500);
-        }
-
-        const buffer = await result.arrayBuffer();
-        const translateResponse = normaliseResponse(JSON.parse(decodeBuffer(buffer)));
-        const translatedText = translateResponse.text;
+        const translator = new Translator({ to: lang, requestFunction: fetch });
+        const translatedText = await translator.translate(text).then(result => result.text);
 
         response.setHeader('Content-Type', 'text/plain; charset=utf-8');
         console.debug('Translated text: ' + translatedText);
@@ -133,7 +100,7 @@ router.post('/google', jsonParser, async (request, response) => {
     }
 });
 
-router.post('/yandex', jsonParser, async (request, response) => {
+router.post('/yandex', async (request, response) => {
     try {
         if (request.body.lang === 'pt-PT') {
             request.body.lang = 'pt';
@@ -189,7 +156,7 @@ router.post('/yandex', jsonParser, async (request, response) => {
     }
 });
 
-router.post('/lingva', jsonParser, async (request, response) => {
+router.post('/lingva', async (request, response) => {
     try {
         const secretUrl = readSecret(request.user.directories, SECRET_KEYS.LINGVA_URL);
         const baseUrl = secretUrl || LINGVA_DEFAULT;
@@ -233,7 +200,7 @@ router.post('/lingva', jsonParser, async (request, response) => {
     }
 });
 
-router.post('/deepl', jsonParser, async (request, response) => {
+router.post('/deepl', async (request, response) => {
     try {
         const key = readSecret(request.user.directories, SECRET_KEYS.DEEPL);
 
@@ -295,7 +262,7 @@ router.post('/deepl', jsonParser, async (request, response) => {
     }
 });
 
-router.post('/onering', jsonParser, async (request, response) => {
+router.post('/onering', async (request, response) => {
     try {
         const secretUrl = readSecret(request.user.directories, SECRET_KEYS.ONERING_URL);
         const url = secretUrl || ONERING_URL_DEFAULT;
@@ -352,7 +319,7 @@ router.post('/onering', jsonParser, async (request, response) => {
     }
 });
 
-router.post('/deeplx', jsonParser, async (request, response) => {
+router.post('/deeplx', async (request, response) => {
     try {
         const secretUrl = readSecret(request.user.directories, SECRET_KEYS.DEEPLX_URL);
         const url = secretUrl || DEEPLX_URL_DEFAULT;
@@ -408,7 +375,7 @@ router.post('/deeplx', jsonParser, async (request, response) => {
     }
 });
 
-router.post('/bing', jsonParser, async (request, response) => {
+router.post('/bing', async (request, response) => {
     try {
         const text = request.body.text;
         let lang = request.body.lang;

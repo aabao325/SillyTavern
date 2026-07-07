@@ -13,18 +13,25 @@ import mime from 'mime-types';
 import archiver from 'archiver';
 import _ from 'lodash';
 import { sync as writeFileAtomicSync } from 'write-file-atomic';
+import sanitize from 'sanitize-filename';
+import ipMatching from 'ip-matching';
 
-import { USER_DIRECTORY_TEMPLATE, DEFAULT_USER, PUBLIC_DIRECTORIES, SETTINGS_FILE } from './constants.js';
-import { getConfigValue, color, delay, setConfigValue, generateTimestamp } from './util.js';
-import { readSecret, writeSecret } from './endpoints/secrets.js';
+import { USER_DIRECTORY_TEMPLATE, DEFAULT_USER, PUBLIC_DIRECTORIES, SETTINGS_FILE, UPLOADS_DIRECTORY } from './constants.js';
+import { getConfigValue, color, delay, generateTimestamp, invalidateFirefoxCache, isPathUnderParent, setPermissionsSync } from './util.js';
+import { allowKeysExposure, readSecret, writeSecret, SECRETS_FILE } from './endpoints/secrets.js';
 import { getContentOfType } from './endpoints/content-manager.js';
+import { serverDirectory } from './server-directory.js';
+import { filterValidIpPatterns, getIpFromRequest } from './express-common.js';
+import { extensionsEnabledFeatureGuard } from './endpoints/extensions.js';
 
 export const KEY_PREFIX = 'user:';
 const AVATAR_PREFIX = 'avatar:';
-const ENABLE_ACCOUNTS = getConfigValue('enableUserAccounts', false);
-const AUTHELIA_AUTH = getConfigValue('autheliaAuth', false);
-const PER_USER_BASIC_AUTH = getConfigValue('perUserBasicAuth', false);
+const ENABLE_ACCOUNTS = getConfigValue('enableUserAccounts', false, 'boolean');
+const AUTHELIA_AUTH = getConfigValue('sso.autheliaAuth', false, 'boolean');
+const AUTHENTIK_AUTH = getConfigValue('sso.authentikAuth', false, 'boolean');
+const PER_USER_BASIC_AUTH = getConfigValue('perUserBasicAuth', false, 'boolean');
 const ANON_CSRF_SECRET = crypto.randomBytes(64).toString('base64');
+const TRUSTED_PROXIES = filterValidIpPatterns(getConfigValue('sso.trustedProxies', ['127.0.0.1', '::1']) ?? [], (entry, message) => `${color.red('Warning')}: Ignoring invalid sso.trustedProxies entry ${color.yellow(entry)} - ${message}`);
 
 /**
  * Cache for user directories.
@@ -32,9 +39,13 @@ const ANON_CSRF_SECRET = crypto.randomBytes(64).toString('base64');
  */
 const DIRECTORIES_CACHE = new Map();
 const PUBLIC_USER_AVATAR = '/img/default-user.png';
+const COOKIE_SECRET_PATH = 'cookie-secret.txt';
 
 const STORAGE_KEYS = {
     csrfSecret: 'csrfSecret',
+    /**
+     * @deprecated Read from COOKIE_SECRET_PATH in DATA_ROOT instead.
+     */
     cookieSecret: 'cookieSecret',
 };
 
@@ -66,6 +77,7 @@ const STORAGE_KEYS = {
  * @property {string} thumbnails - The directory where the thumbnails are stored
  * @property {string} thumbnailsBg - The directory where the background thumbnails are stored
  * @property {string} thumbnailsAvatar - The directory where the avatar thumbnails are stored
+ * @property {string} thumbnailsPersona - The directory where the persona thumbnails are stored
  * @property {string} worlds - The directory where the WI are stored
  * @property {string} user - The directory where the user's public data is stored
  * @property {string} avatars - The directory where the avatars are stored
@@ -91,6 +103,7 @@ const STORAGE_KEYS = {
  * @property {string} vectors - The directory where the vectors are stored
  * @property {string} backups - The directory where the backups are stored
  * @property {string} sysprompt - The directory where the system prompt data is stored
+ * @property {string} reasoning - The directory where the reasoning templates are stored
  */
 
 /**
@@ -114,6 +127,93 @@ export async function ensurePublicDirectoriesExist() {
         }
     }
     return directoriesList;
+}
+
+/**
+ * Prints an error message and exits the process if necessary
+ * @param {string} message The error message to print
+ * @returns {void}
+ */
+function logSecurityAlert(message) {
+    const { basicAuthMode, whitelistMode } = globalThis.COMMAND_LINE_ARGS;
+    if (basicAuthMode || whitelistMode) return; // safe!
+    console.error(color.red(message));
+    if (getConfigValue('securityOverride', false, 'boolean')) {
+        console.warn(color.red('Security has been overridden. If it\'s not a trusted network, change the settings.'));
+        return;
+    }
+    process.exit(1);
+}
+
+/**
+ * Verifies the security settings and prints warnings if necessary
+ * @returns {Promise<void>}
+ */
+export async function verifySecuritySettings() {
+    const { listen, basicAuthMode } = globalThis.COMMAND_LINE_ARGS;
+
+    // Skip all security checks as listen is set to false
+    if (!listen) {
+        return;
+    }
+
+    if (!ENABLE_ACCOUNTS) {
+        logSecurityAlert('Your current SillyTavern configuration is insecure (listening to non-localhost). Enable whitelisting, basic authentication or user accounts.');
+    }
+
+    const users = await getAllEnabledUsers();
+    const unprotectedUsers = users.filter(x => !x.password);
+    const unprotectedAdminUsers = unprotectedUsers.filter(x => x.admin);
+
+    if (unprotectedUsers.length > 0) {
+        console.warn(color.blue('A friendly reminder that the following users are not password protected:'));
+        unprotectedUsers.map(x => `${color.yellow(x.handle)} ${color.red(x.admin ? '(admin)' : '')}`).forEach(x => console.warn(x));
+        console.log();
+        console.warn(`Consider setting a password in the admin panel or by using the ${color.blue('recover.js')} script.`);
+        console.log();
+
+        if (unprotectedAdminUsers.length > 0) {
+            logSecurityAlert('If you are not using basic authentication or whitelisting, you should set a password for all admin users.');
+        }
+    }
+
+    if (basicAuthMode) {
+        const perUserBasicAuth = getConfigValue('perUserBasicAuth', false, 'boolean');
+        if (perUserBasicAuth && !ENABLE_ACCOUNTS) {
+            console.error(color.red(
+                'Per-user basic authentication is enabled, but user accounts are disabled. This configuration may be insecure.',
+            ));
+        } else if (!perUserBasicAuth) {
+            const basicAuthUserName = getConfigValue('basicAuthUser.username', '');
+            const basicAuthUserPassword = getConfigValue('basicAuthUser.password', '');
+            if (!basicAuthUserName || !basicAuthUserPassword) {
+                console.warn(color.yellow(
+                    'Basic Authentication is enabled, but username or password is not set or empty!',
+                ));
+            }
+        }
+    }
+}
+
+export function cleanUploads() {
+    try {
+        const uploadsPath = path.join(globalThis.DATA_ROOT, UPLOADS_DIRECTORY);
+        if (fs.existsSync(uploadsPath)) {
+            const uploads = fs.readdirSync(uploadsPath);
+
+            if (!uploads.length) {
+                return;
+            }
+
+            console.debug(`Cleaning uploads folder (${uploads.length} files)`);
+            uploads.forEach(file => {
+                const pathToFile = path.join(uploadsPath, file);
+                fs.unlinkSync(pathToFile);
+            });
+        }
+    } catch (err) {
+        console.error(err);
+    }
 }
 
 /**
@@ -388,6 +488,48 @@ export async function migrateSystemPrompts() {
     }
 }
 
+export async function migratePublicOverrides() {
+    const migrationMap = [
+        {
+            oldPath: path.join(serverDirectory, 'public', 'error', 'forbidden-by-whitelist.html'),
+            newPath: path.join(globalThis.DATA_ROOT, '_errors', 'forbidden-by-whitelist.html'),
+        },
+        {
+            oldPath: path.join(serverDirectory, 'public', 'error', 'host-not-allowed.html'),
+            newPath: path.join(globalThis.DATA_ROOT, '_errors', 'host-not-allowed.html'),
+        },
+        {
+            oldPath: path.join(serverDirectory, 'public', 'error', 'unauthorized.html'),
+            newPath: path.join(globalThis.DATA_ROOT, '_errors', 'unauthorized.html'),
+        },
+        {
+            oldPath: path.join(serverDirectory, 'public', 'error', 'url-not-found.html'),
+            newPath: path.join(globalThis.DATA_ROOT, '_errors', 'url-not-found.html'),
+        },
+        {
+            oldPath: path.join(serverDirectory, 'public', 'css', 'user.css'),
+            newPath: path.join(globalThis.DATA_ROOT, '_css', 'user.css'),
+        },
+    ];
+
+    for (const { oldPath, newPath } of migrationMap) {
+        try {
+            if (fs.existsSync(newPath)) {
+                continue;
+            }
+            if (fs.existsSync(oldPath)) {
+                fs.mkdirSync(path.dirname(newPath), { recursive: true });
+                fs.cpSync(oldPath, newPath, { force: true });
+                fs.unlinkSync(oldPath);
+                setPermissionsSync(newPath);
+                console.log(`Migrated ${path.basename(oldPath)} to data root.`);
+            }
+        } catch (error) {
+            console.error(`Error migrating ${oldPath} to ${newPath}:`, error);
+        }
+    }
+}
+
 /**
  * Converts a user handle to a storage key.
  * @param {string} handle User handle
@@ -412,12 +554,11 @@ export function toAvatarKey(handle) {
  * @returns {Promise<void>}
  */
 export async function initUserStorage(dataRoot) {
-    globalThis.DATA_ROOT = dataRoot;
-    console.log('Using data root:', color.green(globalThis.DATA_ROOT));
-    console.log();
+    console.log('Using data root:', color.green(dataRoot));
     await storage.init({
-        dir: path.join(globalThis.DATA_ROOT, '_storage'),
+        dir: path.join(dataRoot, '_storage'),
         ttl: false, // Never expire
+        expiredInterval: 0,
     });
 
     const keys = await getAllUserHandles();
@@ -430,17 +571,29 @@ export async function initUserStorage(dataRoot) {
 
 /**
  * Get the cookie secret from the config. If it doesn't exist, generate a new one.
+ * @param {string} dataRoot The root directory for user data
  * @returns {string} The cookie secret
  */
-export function getCookieSecret() {
-    let secret = getConfigValue(STORAGE_KEYS.cookieSecret);
+export function getCookieSecret(dataRoot) {
+    const cookieSecretPath = path.join(dataRoot, COOKIE_SECRET_PATH);
 
-    if (!secret) {
-        console.warn(color.yellow('Cookie secret is missing from config.yaml. Generating a new one...'));
-        secret = crypto.randomBytes(64).toString('base64');
-        setConfigValue(STORAGE_KEYS.cookieSecret, secret);
+    if (fs.existsSync(cookieSecretPath)) {
+        const stat = fs.statSync(cookieSecretPath);
+        if (stat.size > 0) {
+            return fs.readFileSync(cookieSecretPath, 'utf8');
+        }
     }
 
+    const oldSecret = getConfigValue(STORAGE_KEYS.cookieSecret);
+    if (oldSecret) {
+        console.log('Migrating cookie secret from config.yaml...');
+        writeFileAtomicSync(cookieSecretPath, oldSecret, { encoding: 'utf8' });
+        return oldSecret;
+    }
+
+    console.warn(color.yellow('Cookie secret is missing from data root. Generating a new one...'));
+    const secret = crypto.randomBytes(64).toString('base64');
+    writeFileAtomicSync(cookieSecretPath, secret, { encoding: 'utf8' });
     return secret;
 }
 
@@ -461,6 +614,25 @@ export function getCookieSessionName() {
     const hostname = os.hostname() || 'localhost';
     const suffix = crypto.createHash('sha256').update(hostname).digest('hex').slice(0, 8);
     return `session-${suffix}`;
+}
+
+export function getSessionCookieAge() {
+    // Defaults to "no expiration" if not set
+    const configValue = getConfigValue('sessionTimeout', -1, 'number');
+
+    // Convert to milliseconds
+    if (configValue > 0) {
+        return configValue * 1000;
+    }
+
+    // "No expiration" is just 400 days as per RFC 6265
+    if (configValue < 0) {
+        return 400 * 24 * 60 * 60 * 1000;
+    }
+
+    // 0 means session cookie is deleted when the browser session ends
+    // (depends on the implementation of the browser)
+    return undefined;
 }
 
 /**
@@ -547,15 +719,14 @@ export async function getUserAvatar(handle) {
         if (!avatarFile) {
             return PUBLIC_USER_AVATAR;
         }
-        const avatarPath = path.join(directory.avatars, avatarFile);
+        const avatarPath = path.join(directory.avatars, sanitize(avatarFile));
         if (!fs.existsSync(avatarPath)) {
             return PUBLIC_USER_AVATAR;
         }
         const mimeType = mime.lookup(avatarPath);
         const base64Content = fs.readFileSync(avatarPath, 'base64');
         return `data:${mimeType};base64,${base64Content}`;
-    }
-    catch {
+    } catch {
         // Ignore errors
         return PUBLIC_USER_AVATAR;
     }
@@ -591,6 +762,10 @@ export async function tryAutoLogin(request, basicAuthMode) {
             return true;
         }
 
+        if (AUTHENTIK_AUTH && await authentikUserLogin(request)) {
+            return true;
+        }
+
         if (basicAuthMode && PER_USER_BASIC_AUTH && await basicUserLogin(request)) {
             return true;
         }
@@ -614,6 +789,7 @@ async function singleUserLogin(request) {
         const user = await storage.getItem(toKey(userHandles[0]));
         if (user && !user.password) {
             request.session.handle = userHandles[0];
+            request.session.version = getAccountVersion(user);
             return true;
         }
     }
@@ -621,27 +797,94 @@ async function singleUserLogin(request) {
 }
 
 /**
- * Tries auto-login with authlia trusted headers.
+ * Attempts auto-login using an Authelia header.
  * https://www.authelia.com/integration/trusted-header-sso/introduction/
  * @param {import('express').Request} request Request object
  * @returns {Promise<boolean>} Whether auto-login was performed
  */
 async function autheliaUserLogin(request) {
+    return headerUserLogin(request, 'Remote-User');
+}
+
+/**
+ * Attempts auto-login using an Authentik header.
+ * https://docs.goauthentik.io/add-secure-apps/providers/proxy/forward_auth/
+ * @param {import('express').Request} request Request object
+ * @returns {Promise<boolean>} Whether auto-login was performed
+ */
+async function authentikUserLogin(request) {
+    return headerUserLogin(request, 'X-Authentik-Username');
+}
+
+/**
+ * Check if the request can authenticate SSO users based on the trusted proxies configuration and the request's IP address.
+ * @param {string} ip The IP address of the request
+ * @return {boolean} If the request is from a trusted proxy based on the configuration
+ */
+function isRequestFromTrustedProxy(ip) {
+    if (!Array.isArray(TRUSTED_PROXIES)) {
+        console.warn(color.yellow('sso.trustedProxies is not an array. Please check your config.yaml. SSO auto-login will not work.'));
+        return false;
+    }
+
+    // Bypass magic value check if the user explicitly configured
+    if (TRUSTED_PROXIES.length === 1 && TRUSTED_PROXIES[0] === '*') {
+        console.warn(color.yellow('sso.trustedProxies is set to accept all IPs. This is not recommended for production environments.'));
+        return true;
+    }
+
+    // If the IP is missing or unknown, we can't trust it
+    if (!ip || ip === 'unknown') {
+        return false;
+    }
+
+    // At least one entry in the trusted proxies list must match the request IP for it to be considered trusted
+    for (const entry of TRUSTED_PROXIES) {
+        try {
+            // This will throw if the entry is not a valid IP or CIDR
+            const match = ipMatching.getMatch(entry);
+            if (ipMatching.matches(ip, match)) {
+                return true;
+            }
+        } catch (e) {
+            continue;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Tries auto-login with a given header.
+ * @param {import('express').Request} request Request object
+ * @param {string} [header='Remote-User'] The header to use for the trusted user
+ * @returns {Promise<boolean>} Whether auto-login was performed
+ */
+async function headerUserLogin(request, header = 'Remote-User') {
     if (!request.session) {
         return false;
     }
 
-    const remoteUser = request.get('Remote-User');
+    const remoteUser = request.get(header);
     if (!remoteUser) {
+        return false;
+    }
+    console.debug(`Attempting auto-login for user from header ${header}: ${remoteUser}`);
+
+    const ip = getIpFromRequest(request);
+    const isTrusted = isRequestFromTrustedProxy(ip);
+    if (!isTrusted) {
+        console.warn(color.yellow(`Received ${header} header from untrusted IP ${ip}. Ignoring for auto-login.`));
         return false;
     }
 
     const userHandles = await getAllUserHandles();
     for (const userHandle of userHandles) {
-        if (remoteUser === userHandle) {
+        if (remoteUser.toLowerCase() === userHandle) {
             const user = await storage.getItem(toKey(userHandle));
             if (user && user.enabled) {
                 request.session.handle = userHandle;
+                request.session.version = getAccountVersion(user);
                 return true;
             }
         }
@@ -671,9 +914,10 @@ async function basicUserLogin(request) {
         return false;
     }
 
-    const [username, password] = Buffer.from(credentials, 'base64')
+    const [username, ...passwordParts] = Buffer.from(credentials, 'base64')
         .toString('utf8')
         .split(':');
+    const password = passwordParts.join(':');
 
     const userHandles = await getAllUserHandles();
     for (const userHandle of userHandles) {
@@ -682,12 +926,24 @@ async function basicUserLogin(request) {
             // Verify pass again here just to be sure
             if (user && user.enabled && user.password && user.password === getPasswordHash(password, user.salt)) {
                 request.session.handle = userHandle;
+                request.session.version = getAccountVersion(user);
                 return true;
             }
         }
     }
 
     return false;
+}
+
+/**
+ * Gets the account version tag for the provided user.
+ * @param {User} user User account object
+ * @returns {string} Account version tag
+ */
+export function getAccountVersion(user) {
+    return crypto.createHash('shake256', { outputLength: 8 })
+        .update(JSON.stringify([user.handle, user.password, user.salt]))
+        .digest('hex');
 }
 
 /**
@@ -734,6 +990,20 @@ export async function setUserDataMiddleware(request, response, next) {
         return next();
     }
 
+    if (Object.hasOwn(request.session, 'version')) {
+        if (request.session.version !== getAccountVersion(user)) {
+            console.warn('User data has changed since the session was created. Invalidating session for user:', handle);
+            request.session.handle = null;
+            request.session.csrfToken = null;
+            request.session.version = null;
+            request.session = null;
+            return response.sendStatus(403);
+        }
+    } else {
+        // If there is no version in the session, it means it's an old session. Upgrade it by adding the version.
+        request.session.version = getAccountVersion(user);
+    }
+
     const directories = getUserDirectories(handle);
     request.user = {
         profile: user,
@@ -763,6 +1033,31 @@ export function requireLoginMiddleware(request, response, next) {
 }
 
 /**
+ * Middleware to host the login page.
+ * @param {import('express').Request} request Request object
+ * @param {import('express').Response} response Response object
+ */
+export async function loginPageMiddleware(request, response) {
+    if (!ENABLE_ACCOUNTS) {
+        console.log('User accounts are disabled. Redirecting to index page.');
+        return response.redirect('/');
+    }
+
+    try {
+        const { basicAuthMode } = globalThis.COMMAND_LINE_ARGS;
+        const autoLogin = await tryAutoLogin(request, basicAuthMode);
+
+        if (autoLogin) {
+            return response.redirect('/');
+        }
+    } catch (error) {
+        console.error('Error during auto-login:', error);
+    }
+
+    return response.sendFile('login.html', { root: path.join(serverDirectory, 'public') });
+}
+
+/**
  * Creates a route handler for serving files from a specific directory.
  * @param {(req: import('express').Request) => string} directoryFn A function that returns the directory path to serve files from
  * @returns {import('express').RequestHandler}
@@ -772,10 +1067,16 @@ function createRouteHandler(directoryFn) {
         try {
             const directory = directoryFn(req);
             const filePath = decodeURIComponent(req.params[0]);
-            const exists = fs.existsSync(path.join(directory, filePath));
+            const fullPath = path.join(directory, filePath);
+            if (!isPathUnderParent(directory, path.resolve(fullPath))) {
+                return res.sendStatus(403);
+            }
+            const exists = fs.existsSync(fullPath);
             if (!exists) {
                 return res.sendStatus(404);
             }
+
+            invalidateFirefoxCache(filePath, req, res);
             return res.sendFile(filePath, { root: directory });
         } catch (error) {
             return res.sendStatus(500);
@@ -793,13 +1094,20 @@ function createExtensionsRouteHandler(directoryFn) {
         try {
             const directory = directoryFn(req);
             const filePath = decodeURIComponent(req.params[0]);
-
-            const existsLocal = fs.existsSync(path.join(directory, filePath));
+            const localPath = path.join(directory, filePath);
+            if (!isPathUnderParent(directory, path.resolve(localPath))) {
+                return res.sendStatus(403);
+            }
+            const existsLocal = fs.existsSync(localPath);
             if (existsLocal) {
                 return res.sendFile(filePath, { root: directory });
             }
 
-            const existsGlobal = fs.existsSync(path.join(PUBLIC_DIRECTORIES.globalExtensions, filePath));
+            const globalPath = path.join(PUBLIC_DIRECTORIES.globalExtensions, filePath);
+            if (!isPathUnderParent(PUBLIC_DIRECTORIES.globalExtensions, path.resolve(globalPath))) {
+                return res.sendStatus(403);
+            }
+            const existsGlobal = fs.existsSync(globalPath);
             if (existsGlobal) {
                 return res.sendFile(filePath, { root: PUBLIC_DIRECTORIES.globalExtensions });
             }
@@ -863,7 +1171,14 @@ export async function createBackupArchive(handle, response) {
     archive.pipe(response);
 
     // Append files from a sub-directory, putting its contents at the root of archive
-    archive.directory(directories.root, false);
+    const ignore = allowKeysExposure ? [] : [SECRETS_FILE, 'backups/secrets_migration_*.json'];
+    archive.glob('**/*', {
+        cwd: directories.root,
+        follow: false,
+        stat: true,
+        dot: true,
+        ignore,
+    });
     archive.finalize();
 }
 
@@ -901,4 +1216,4 @@ router.use('/User%20Avatars/*', createRouteHandler(req => req.user.directories.a
 router.use('/assets/*', createRouteHandler(req => req.user.directories.assets));
 router.use('/user/images/*', createRouteHandler(req => req.user.directories.userImages));
 router.use('/user/files/*', createRouteHandler(req => req.user.directories.files));
-router.use('/scripts/extensions/third-party/*', createExtensionsRouteHandler(req => req.user.directories.extensions));
+router.use('/scripts/extensions/third-party/*', extensionsEnabledFeatureGuard, createExtensionsRouteHandler(req => req.user.directories.extensions));
